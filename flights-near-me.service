@@ -1,0 +1,16 @@
+# systemd user service: runs the display in the logged-in desktop session.
+#   mkdir -p ~/.config/systemd/user
+#   cp flights-near-me.service ~/.config/systemd/user/
+#   systemctl --user enable --now flights-near-me
+[Unit]
+Description=Flight Near Me display
+After=graphical-session.target network-online.target
+
+[Service]
+WorkingDirectory=%h/flights-near-me
+ExecStart=%h/flights-near-me/.venv/bin/python %h/flights-near-me/flight_near_me.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,1 @@
+- [Use local tmp folder](use-local-tmp-folder.md) — scratch files go in ./tmp, not /tmp (avoids permission prompts)

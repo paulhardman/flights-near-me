@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+tmp/
+lookup_cache.json
+lookup_cache.json.tmp
+screenshot-*.png
+.DS_Store
+
+# Personal settings: your location stays local
+config.json
+coastline.json
+
+# Session logs contain personal details
+claude/logs/

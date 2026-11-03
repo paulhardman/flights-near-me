@@ -1,0 +1,20 @@
+{
+  "latitude": 50.4176,
+  "longitude": -5.1003,
+  "feed_host": "localhost",
+  "feed_port": 30003,
+  "units": "km",
+  "range": 50,
+  "overhead_radius": 5,
+  "fullscreen": true,
+  "window_size": [1280, 720],
+  "fps": 10,
+  "online_lookups": true,
+  "cache_file": "lookup_cache.json",
+  "trail_seconds": 180,
+  "stale_seconds": 60,
+  "coastline_file": "coastline.example.json",
+  "landmarks": [
+    {"name": "EGHQ", "lat": 50.4406, "lon": -4.9954}
+  ]
+}
