@@ -14,6 +14,8 @@ Live display of aircraft passing overhead, driven by a dump1090 receiver.
   [adsbdb.com](https://www.adsbdb.com), cached in `lookup_cache.json`.
   If a cached route doesn't fit where the aircraft actually is, the route is
   hidden; the airline is still shown.
+- **Airport board** (optional) along the bottom third of the screen: the last
+  5 arrivals and next 5 departures at Cork Airport, refreshed every 3 minutes.
 
 Data comes from dump1090's SBS/BaseStation feed (port 30003).
 
@@ -41,7 +43,7 @@ location stays out of the repo.
 .venv/bin/python flight_near_me.py --windowed # in a window
 ```
 
-Options: `--host`, `--port`, `--no-lookups`, `--config path/to/config.json`.
+Options: `--host`, `--port`, `--no-lookups`, `--no-board`, `--config path/to/config.json`.
 
 Keys: `+`/`-` or mouse wheel to zoom, `F` toggles fullscreen, `S` saves a
 screenshot, `Q`/`Esc` quits.
@@ -60,6 +62,23 @@ screenshot, `Q`/`Esc` quits.
 | `trail_seconds`, `stale_seconds` | trail length; when to drop silent aircraft |
 | `landmarks` | list of `{"name", "lat", "lon"}` to mark on the radar |
 | `coastline_file` | coastline outline to draw (empty string to disable) |
+| `airport_board` | arrivals/departures board, see below (`null` to disable) |
+
+### Airport board
+
+```json
+"airport_board": {
+  "name": "Cork Airport",
+  "url": "https://www.corkairport.com/api/flight-listing",
+  "count": 5,
+  "refresh_seconds": 180
+}
+```
+
+The data comes from the same (undocumented) API that the live arrivals and
+departures pages on corkairport.com use, so it may break if the site changes.
+`"airport_board": true` uses the Cork defaults above. `--no-board` hides it for
+one run. Times are shown in the computer's local time zone.
 
 ## Coastline
 

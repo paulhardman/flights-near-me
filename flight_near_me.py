@@ -17,9 +17,11 @@ import ssl
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 import pygame  # noqa: E402
@@ -51,6 +53,16 @@ DEFAULT_CONFIG = {
     "landmarks": [
         {"name": "EGHQ", "lat": 50.4406, "lon": -4.9954},
     ],
+    # Airport arrivals/departures board along the bottom third of the screen.
+    # Uses the flight-listing API behind corkairport.com; null turns it off.
+    "airport_board": None,
+}
+
+BOARD_DEFAULTS = {
+    "name": "Cork Airport",
+    "url": "https://www.corkairport.com/api/flight-listing",
+    "count": 5,
+    "refresh_seconds": 180,
 }
 
 UNIT_FACTORS = {"km": 1.0, "nm": 1 / 1.852, "mi": 1 / 1.609344}
@@ -362,6 +374,129 @@ class LookupService(threading.Thread):
             pass
 
 
+# ---------------------------------------------------------------------------
+# Airport arrivals / departures board
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BoardFlight:
+    flight: str
+    place: str
+    scheduled: datetime          # local time
+    status: str
+    code: int
+    delayed: bool
+
+
+def _parse_board_time(s):
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone()
+    except (AttributeError, ValueError):
+        return None
+
+
+class AirportBoard(threading.Thread):
+    """Polls an airport's flight-listing API (as used by corkairport.com) for
+    the most recent arrivals and the next departures."""
+
+    ARRIVED_CODES = range(11, 16)   # landed, arrived, baggage first/last/delivered
+    DEPARTED_CODES = {8}            # departed
+
+    def __init__(self, cfg):
+        super().__init__(daemon=True)
+        cfg = {**BOARD_DEFAULTS, **(cfg if isinstance(cfg, dict) else {})}
+        self.airport_name = cfg["name"]
+        self.url = cfg["url"].rstrip("/")
+        self.count = int(cfg["count"])
+        self.refresh = max(60, int(cfg["refresh_seconds"]))
+        self.lock = threading.Lock()
+        self.arrivals, self.departures = [], []
+        self.updated = None
+        self.error = ""
+
+    def snapshot(self):
+        with self.lock:
+            return list(self.arrivals), list(self.departures), self.updated, self.error
+
+    def run(self):
+        while True:
+            try:
+                arrivals, departures = self._fetch_all()
+                with self.lock:
+                    self.arrivals, self.departures = arrivals, departures
+                    self.updated, self.error = time.time(), ""
+                wait = self.refresh
+            except (OSError, ValueError, KeyError, TypeError) as e:
+                with self.lock:
+                    self.error = str(e) or type(e).__name__
+                wait = 60
+            time.sleep(wait)
+
+    def _get(self, kind, **params):
+        url = f"{self.url}/{kind}?{urllib.parse.urlencode(params)}"
+        req = urllib.request.Request(url, headers={"User-Agent": "flight-near-me/1.0"})
+        with urllib.request.urlopen(req, timeout=15, context=SSL_CONTEXT) as r:
+            content = json.load(r)["content"]
+        place_key = "originAirportName" if kind == "arrivals" else "destinationAirportName"
+        flights = []
+        for f in content:
+            sched = _parse_board_time(f.get("scheduledDateTime"))
+            if sched is None:
+                continue
+            flights.append(BoardFlight(
+                flight=f.get("flightIdentity") or "",
+                place=f.get(place_key) or f.get("airportCode") or "",
+                scheduled=sched,
+                status=(f.get("statusMessage") or "").strip(),
+                code=f.get("status") if isinstance(f.get("status"), int) else -1,
+                delayed=bool(f.get("isDelayed")),
+            ))
+        return flights
+
+    @staticmethod
+    def _merge(*lists):
+        seen, out = set(), []
+        for f in (f for lst in lists for f in lst):
+            key = (f.flight, f.scheduled)
+            if key not in seen:
+                seen.add(key)
+                out.append(f)
+        return sorted(out, key=lambda f: f.scheduled)
+
+    def _arrived(self, f):
+        return f.code in self.ARRIVED_CODES or f.status.startswith(
+            ("LANDED", "ARRIVED", "BAGGAGE", "FIRST BAG", "LAST BAG"))
+
+    def _departed(self, f):
+        return f.code in self.DEPARTED_CODES or f.status.startswith(("DEPARTED", "AIRBORNE"))
+
+    def _fetch_all(self):
+        today = date.today()
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        day = lambda d: d.isoformat()  # noqa: E731
+
+        # Arrivals: the listing normally starts around "now", so also ask for
+        # the flights before now. Early in the day, fall back to yesterday.
+        arr = self._merge(self._get("arrivals", date=day(today), limit=10, before=now_utc),
+                          self._get("arrivals", date=day(today), limit=50))
+        landed = [f for f in arr if self._arrived(f)]
+        if len(landed) < self.count:
+            prev = self._get("arrivals", date=day(today - timedelta(days=1)), limit=50)
+            landed = self._merge(prev, landed)
+            landed = [f for f in landed if self._arrived(f)]
+        arrivals = landed[-self.count:]
+
+        # Departures: everything not yet gone; late at night, add tomorrow's.
+        dep = [f for f in self._get("departures", date=day(today), limit=50)
+               if not self._departed(f)]
+        if len(dep) < self.count:
+            dep = self._merge(dep, self._get("departures", date=day(today + timedelta(days=1)),
+                                             limit=50))
+        departures = dep[:self.count]
+        return arrivals, departures
+
+
 def route_plausible(route, lat, lon):
     """adsbdb routes are keyed on callsign and are sometimes stale. Reject a
     route if the aircraft is well off the origin->destination corridor."""
@@ -380,6 +515,7 @@ def route_plausible(route, lat, lon):
 
 BG = (6, 10, 18)
 PANEL_BG = (12, 18, 30)
+BOARD_BG = (9, 14, 24)
 RADAR_BG = (4, 14, 12)
 RING = (28, 70, 55)
 RING_TEXT = (60, 120, 95)
@@ -414,8 +550,8 @@ class View:
 
 
 class Display:
-    def __init__(self, cfg, store, lookup):
-        self.cfg, self.store, self.lookup = cfg, store, lookup
+    def __init__(self, cfg, store, lookup, board=None):
+        self.cfg, self.store, self.lookup, self.board = cfg, store, lookup, board
         self.lat0, self.lon0 = cfg["latitude"], cfg["longitude"]
         self.units = cfg["units"] if cfg["units"] in UNIT_FACTORS else "km"
         self.unit_factor = UNIT_FACTORS[self.units]
@@ -453,8 +589,11 @@ class Display:
 
     def _layout(self):
         W, H = self.screen.get_size()
+        board_h = H // 3 if self.board else 0
+        self.board_rect = pygame.Rect(0, H - board_h, W, board_h)
+        H -= board_h  # radar and panel share what is left above the board
         if W >= H * 1.2:
-            side = min(H, int(W * 0.58))
+            side = W // 2  # radar and panel split the width evenly
             self.radar_rect = pygame.Rect(0, 0, side, H)
             self.panel_rect = pygame.Rect(side, 0, W - side, H)
         else:  # portrait monitor: radar on top
@@ -493,7 +632,8 @@ class Display:
     def _build_radar_bg(self):
         r = self.radar_rect
         self.cx, self.cy = r.centerx, r.centery
-        self.radius_px = min(r.w, r.h) / 2 - 12 * self.ui
+        # Fill the wider dimension; the circle may be cut off top and bottom
+        self.radius_px = max(r.w, r.h) / 2 - 12 * self.ui
         self.px_per_km = self.radius_px / self.range_km
 
         bg = pygame.Surface(r.size)
@@ -512,7 +652,8 @@ class Display:
             a = math.radians(ang)
             d = self.radius_px - 14 * self.ui
             s = self.f_med.render(label, True, RING_TEXT)
-            bg.blit(s, s.get_rect(center=(cx + math.sin(a) * d, cy - math.cos(a) * d)))
+            rect = s.get_rect(center=(cx + math.sin(a) * d, cy - math.cos(a) * d))
+            bg.blit(s, rect.clamp(bg.get_rect().inflate(-8 * self.ui, -8 * self.ui)))
         # Range rings
         for i in range(1, 5):
             rr = self.radius_px * i / 4
@@ -617,6 +758,7 @@ class Display:
         self.screen.fill(BG)
         self.draw_radar(views, now)
         self.draw_panel(views, len(aircraft), now)
+        self.draw_board()
         pygame.display.flip()
 
     def draw_radar(self, views, now):
@@ -854,6 +996,82 @@ class Display:
         self.blit_text("   ".join(bits), self.f_small, ACCENT if overhead else DIM, (ix, iy), max_w=iw)
         return box.bottom
 
+    # -- airport board -------------------------------------------------------
+
+    def draw_board(self):
+        r = self.board_rect
+        if not self.board or not r.h:
+            return
+        pygame.draw.rect(self.screen, BOARD_BG, r)
+        pygame.draw.line(self.screen, FAINT, r.topleft, r.topright, 1)
+        arrivals, departures, updated, error = self.board.snapshot()
+        pad = int(14 * self.ui)
+        x, y, w = r.x + pad, r.y + pad // 2, r.w - 2 * pad
+
+        self.blit_text(self.board.airport_name, self.f_med, TEXT, (x, y))
+        if error:
+            msg = f"Update failed: {error}" + (
+                f"  (showing {time.strftime('%H:%M', time.localtime(updated))})" if updated else "")
+            self.blit_text(msg, self.f_tiny, BAD, (x + w, y), max_w=w * 0.6, align="right")
+        elif updated:
+            self.blit_text(f"updated {time.strftime('%H:%M', time.localtime(updated))}",
+                           self.f_tiny, FAINT, (x + w, y), align="right")
+        y += self.f_med.get_linesize() + pad // 4
+
+        gap = 2 * pad
+        col_w = (w - gap) / 2
+        n = self.board.count
+        loading = "Loading…" if not updated and not error else "No flights"
+        self.draw_board_table(f"ARRIVALS  ·  last {n}", "From", arrivals, loading,
+                              pygame.Rect(x, y, col_w, r.bottom - y - pad // 2))
+        self.draw_board_table(f"DEPARTURES  ·  next {n}", "To", departures, loading,
+                              pygame.Rect(x + col_w + gap, y, col_w, r.bottom - y - pad // 2))
+
+    @staticmethod
+    def board_status_color(f):
+        s = f.status
+        if "CANCEL" in s or "DIVERT" in s:
+            return BAD
+        if s.startswith(("LANDED", "ARRIVED", "BAGGAGE", "FIRST BAG", "LAST BAG", "DEPARTED")):
+            return GOOD
+        if f.delayed or "DELAY" in s or any(
+                k in s for k in ("BOARDING", "GATE", "FINAL CALL", "APPROACH", "LAST CALL")):
+            return ACCENT
+        return DIM
+
+    def draw_board_table(self, title, place_label, flights, empty_msg, box):
+        x, y, w = box.x, box.y, box.w
+        self.blit_text(title, self.f_small, ACCENT, (x, y))
+        y += self.f_small.get_linesize()
+        cols = [x, x + w * 0.14, x + w * 0.32, x + w * 0.64]
+        for label, cx in zip(("Time", "Flight", place_label, "Status"), cols):
+            self.blit_text(label, self.f_tiny, FAINT, (cx, y))
+        y += self.f_tiny.get_linesize() + 1
+        pygame.draw.line(self.screen, FAINT, (x, y), (x + w, y), 1)
+        y += 3
+        if not flights:
+            self.blit_text(empty_msg, self.f_small, DIM, (x, y + 4))
+            return
+        # Largest font that fits all rows in the space available
+        row_space = (box.bottom - y) / max(1, self.board.count)
+        def fits(f):
+            return (f.get_linesize() + 2 <= row_space
+                    and f.size("00:00")[0] + 6 <= cols[1] - cols[0]
+                    and f.size("EI1234")[0] + 6 <= cols[2] - cols[1])
+        font = next((f for f in (self.f_large, self.f_med, self.f_small) if fits(f)), self.f_tiny)
+        row_h = max(font.get_linesize() + 2, min(row_space, font.get_linesize() * 1.3))
+        for f in flights:
+            if y + font.get_linesize() > box.bottom:
+                break
+            self.blit_text(f.scheduled.strftime("%H:%M"), font, TEXT, (cols[0], y))
+            self.blit_text(f.flight, font, TEXT, (cols[1], y), max_w=cols[2] - cols[1] - 6)
+            self.blit_text(f.place, font, TEXT, (cols[2], y), max_w=cols[3] - cols[2] - 6)
+            status_font = self.f_med if font is self.f_large else font
+            sy = y + font.get_ascent() - status_font.get_ascent()
+            self.blit_text(f.status.title(), status_font, self.board_status_color(f), (cols[3], sy),
+                           max_w=x + w - cols[3])
+            y += row_h
+
     # -- input ---------------------------------------------------------------
 
     def handle_event(self, e):
@@ -925,6 +1143,7 @@ def main():
     ap.add_argument("--port", type=int, help="dump1090 SBS port (overrides config)")
     ap.add_argument("--windowed", action="store_true", help="run in a window, not fullscreen")
     ap.add_argument("--no-lookups", action="store_true", help="disable online lookups")
+    ap.add_argument("--no-board", action="store_true", help="hide the airport arrivals/departures board")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -944,8 +1163,12 @@ def main():
         cache_path = os.path.join(HERE, cache_path)
     lookup = LookupService(cache_path, cfg["online_lookups"])
     lookup.start()
+    board = None
+    if cfg.get("airport_board") and not args.no_board:
+        board = AirportBoard(cfg["airport_board"])
+        board.start()
     try:
-        Display(cfg, store, lookup).run()
+        Display(cfg, store, lookup, board).run()
     finally:
         lookup.save()
 
